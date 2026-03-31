@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import base64
 import json
@@ -6,6 +7,7 @@ import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+import nodesemver
 
 # -----------------------------
 # Load env
@@ -75,6 +77,28 @@ def validate_github_token():
 
     logger.error(f"❌ Token validation failed: {resp.status_code} - {resp.text}")
     return False
+
+
+# -----------------------------
+# Semver helper
+# -----------------------------
+def check_blacklist_risk(declared_range, blacklisted_versions):
+    """
+    Check if any blacklisted version satisfies the declared version range.
+    Returns a list of blacklisted versions that could match.
+    """
+    if not declared_range or not blacklisted_versions:
+        return []
+
+    at_risk = []
+    for version in blacklisted_versions:
+        try:
+            if nodesemver.satisfies(version, declared_range):
+                at_risk.append(version)
+        except Exception as e:
+            logger.debug(f"Semver check failed for {version} against {declared_range}: {e}")
+    
+    return at_risk
 
 
 # -----------------------------
@@ -223,27 +247,36 @@ def find_package_files(repo):
 
     package_jsons = []
     package_locks = []
+    dockerfiles = []
 
     for item in tree:
         if item["type"] != "blob":
             continue
 
         path = item["path"]
+        filename = path.split("/")[-1].lower()
 
         if path.endswith("/package.json") or path == "package.json":
             package_jsons.append(path)
         elif path.endswith("/package-lock.json") or path == "package-lock.json":
             package_locks.append(path)
+        elif filename == "dockerfile" or filename.startswith("dockerfile."):
+            dockerfiles.append(path)
 
-    logger.debug(f"{repo}: found {len(package_jsons)} package.json, {len(package_locks)} package-lock.json")
+    logger.debug(f"{repo}: found {len(package_jsons)} package.json, {len(package_locks)} package-lock.json, {len(dockerfiles)} Dockerfile(s)")
 
-    return package_jsons, package_locks
+    return package_jsons, package_locks, dockerfiles
 
 
 # -----------------------------
 # package.json
 # -----------------------------
 def check_package_json(repo, path):
+    """
+    Returns a dict with declared versions from dependencies and/or devDependencies.
+    Example: {"dependencies": "^2.0.0", "devDependencies": "^1.5.0"}
+    Returns None if package not found in either section.
+    """
     content = get_file_content(repo, path)
     if not content:
         return None
@@ -253,42 +286,112 @@ def check_package_json(repo, path):
     except:
         return None
 
+    found = {}
     for section in ["dependencies", "devDependencies"]:
         if section in pkg and PACKAGE_NAME in pkg[section]:
-            logger.info(f"{repo}: found in {path}")
-            return pkg[section][PACKAGE_NAME]
+            logger.info(f"{repo}: found in {path} ({section})")
+            found[section] = pkg[section][PACKAGE_NAME]
 
-    return None
+    return found if found else None
 
 
 # -----------------------------
 # package-lock.json
 # -----------------------------
 def check_package_lock(repo, path):
+    """
+    Returns a list of all occurrences of the package in the lockfile.
+    Each occurrence is a dict: {"location": "node_modules/...", "version": "x.y.z"}
+    """
     content = get_file_content(repo, path)
     if not content:
-        return None
+        return []
 
     try:
         lock = json.loads(content)
     except:
-        return None
+        return []
 
+    found = []
+
+    # Lockfile v2/v3 format (packages object)
     if "packages" in lock:
-        direct_key = f"node_modules/{PACKAGE_NAME}"
-        if direct_key in lock["packages"]:
-            logger.info(f"{repo}: found in {path} (direct)")
-            return lock["packages"][direct_key].get("version")
-        
         for k, v in lock["packages"].items():
-            if k.endswith(f"node_modules/{PACKAGE_NAME}"):
-                logger.info(f"{repo}: found in {path} (nested: {k})")
-                return v.get("version")
+            if k == f"node_modules/{PACKAGE_NAME}" or k.endswith(f"/node_modules/{PACKAGE_NAME}"):
+                version = v.get("version")
+                if version:
+                    location_type = "direct" if k == f"node_modules/{PACKAGE_NAME}" else "nested"
+                    logger.info(f"{repo}: found in {path} ({location_type}: {k})")
+                    found.append({"location": k, "version": version})
 
-    if "dependencies" in lock and PACKAGE_NAME in lock["dependencies"]:
-        return lock["dependencies"][PACKAGE_NAME].get("version")
+    # Lockfile v1 format (dependencies object) - fallback if nothing found in packages
+    if not found and "dependencies" in lock and PACKAGE_NAME in lock["dependencies"]:
+        version = lock["dependencies"][PACKAGE_NAME].get("version")
+        if version:
+            logger.info(f"{repo}: found in {path} (v1 format)")
+            found.append({"location": f"node_modules/{PACKAGE_NAME}", "version": version})
 
-    return None
+    return found
+
+
+# -----------------------------
+# Dockerfile npm detection
+# -----------------------------
+NPM_INSTALL_PATTERN = re.compile(
+    r'\b(npm\s+(?:i|ci|install)(?:\s+[^\n&|;]*)?)',
+    re.IGNORECASE
+)
+
+def is_global_install(command):
+    """Check if npm command is a global install (-g or --global)."""
+    parts = command.lower().split()
+    return '-g' in parts or '--global' in parts
+
+
+def check_dockerfile(repo, path):
+    """
+    Check a Dockerfile for npm install commands.
+    Returns a list of npm commands found with line numbers.
+    Ignores global installs (-g, --global) as they don't affect project dependencies.
+    """
+    content = get_file_content(repo, path)
+    if not content:
+        return []
+
+    found = []
+    lines = content.split('\n')
+    
+    for line_num, line in enumerate(lines, 1):
+        # Skip comments
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        
+        matches = NPM_INSTALL_PATTERN.findall(line)
+        for match in matches:
+            command = match.strip()
+            
+            # Skip global installs (npm i -g, npm install --global)
+            if is_global_install(command):
+                logger.debug(f"{repo}: skipping global install in {path}:{line_num} → {command}")
+                continue
+            
+            # Classify the command type
+            if 'npm ci' in command.lower() or command.lower().startswith('npm ci'):
+                cmd_type = 'npm ci'
+            elif 'npm i ' in command.lower() or command.lower().endswith('npm i'):
+                cmd_type = 'npm i'
+            else:
+                cmd_type = 'npm install'
+            
+            found.append({
+                "line": line_num,
+                "command": command,
+                "type": cmd_type
+            })
+            logger.info(f"{repo}: found '{cmd_type}' in {path}:{line_num}")
+
+    return found
 
 
 # -----------------------------
@@ -299,45 +402,68 @@ def scan_repo(repo):
 
     logger.info(f"Scanning {full_name}")
 
-    package_jsons, package_locks = find_package_files(full_name)
+    package_jsons, package_locks, dockerfiles = find_package_files(full_name)
 
-    if not package_jsons and not package_locks:
-        logger.debug(f"{full_name}: no package files found")
+    if not package_jsons and not package_locks and not dockerfiles:
+        logger.debug(f"{full_name}: no package files or Dockerfiles found")
         return None
 
     matches = []
+    processed_locks = set()
+    dockerfile_matches = []
 
+    # Process each package.json with its corresponding lockfile
     for pkg_path in package_jsons:
-        declared = check_package_json(full_name, pkg_path)
-        if declared:
-            lock_path = pkg_path.replace("package.json", "package-lock.json")
-            resolved = None
-            if lock_path in package_locks:
-                resolved = check_package_lock(full_name, lock_path)
+        lock_path = pkg_path.replace("package.json", "package-lock.json")
+        declared_info = check_package_json(full_name, pkg_path)
+        resolved_list = []
+        missing_lockfile = lock_path not in package_locks
+        
+        if not missing_lockfile:
+            resolved_list = check_package_lock(full_name, lock_path)
+            processed_locks.add(lock_path)
+        elif declared_info:
+            logger.warning(f"{full_name}: missing lockfile for {pkg_path}")
 
+        # Report if package is found in either package.json OR lockfile
+        if declared_info or resolved_list:
             matches.append({
                 "path": pkg_path,
-                "declared_version": declared,
-                "resolved_version": resolved
+                "declared_versions": declared_info,
+                "resolved_versions": resolved_list,
+                "missing_lockfile": missing_lockfile if declared_info else False,
+                "is_transitive_only": not declared_info and bool(resolved_list)
             })
 
+    # Process standalone lockfiles (no corresponding package.json)
     for lock_path in package_locks:
-        pkg_path = lock_path.replace("package-lock.json", "package.json")
-        if pkg_path in package_jsons:
+        if lock_path in processed_locks:
             continue
 
-        resolved = check_package_lock(full_name, lock_path)
-        if resolved:
+        resolved_list = check_package_lock(full_name, lock_path)
+        if resolved_list:
             matches.append({
                 "path": lock_path,
-                "declared_version": None,
-                "resolved_version": resolved
+                "declared_versions": None,
+                "resolved_versions": resolved_list,
+                "missing_lockfile": False,
+                "is_transitive_only": True
             })
 
-    if matches:
+    # Process Dockerfiles for npm install commands
+    for dockerfile_path in dockerfiles:
+        npm_commands = check_dockerfile(full_name, dockerfile_path)
+        if npm_commands:
+            dockerfile_matches.append({
+                "path": dockerfile_path,
+                "npm_commands": npm_commands
+            })
+
+    if matches or dockerfile_matches:
         return {
             "repo": full_name,
-            "matches": matches
+            "matches": matches,
+            "dockerfile_matches": dockerfile_matches
         }
 
     return None
@@ -347,38 +473,71 @@ def scan_repo(repo):
 # Report generation
 # -----------------------------
 def generate_report(results):
-    declared_versions = set()
+    declared_versions = {"dependencies": set(), "devDependencies": set()}
     resolved_versions = set()
     blacklisted_found = []
+    missing_lockfiles = []
+    transitive_only_count = 0
+    dockerfile_findings = {"npm ci": [], "npm install": [], "npm i": []}
 
     for result in results:
         repo = result["repo"]
-        for match in result["matches"]:
-            declared = match.get("declared_version")
-            resolved = match.get("resolved_version")
+        for match in result.get("matches", []):
+            declared_info = match.get("declared_versions") or {}
+            resolved_list = match.get("resolved_versions", [])
+            
+            if match.get("is_transitive_only"):
+                transitive_only_count += 1
 
-            if declared:
-                declared_versions.add(declared)
-            if resolved:
-                resolved_versions.add(resolved)
+            for dep_type, version in declared_info.items():
+                declared_versions[dep_type].add(version)
 
-            if BLACKLISTED_VERSIONS:
-                if resolved and resolved in BLACKLISTED_VERSIONS:
+            if match.get("missing_lockfile") and declared_info:
+                missing_lockfiles.append({
+                    "repo": repo,
+                    "path": match["path"],
+                    "declared_info": declared_info
+                })
+            
+            for resolved_item in resolved_list:
+                version = resolved_item["version"]
+                location = resolved_item["location"]
+                resolved_versions.add(version)
+
+                if BLACKLISTED_VERSIONS and version in BLACKLISTED_VERSIONS:
+                    dep_types = list(declared_info.keys()) if declared_info else ["transitive"]
                     blacklisted_found.append({
                         "repo": repo,
                         "path": match["path"],
-                        "version": resolved,
-                        "type": "resolved"
+                        "location": location,
+                        "version": version,
+                        "type": "resolved",
+                        "dep_types": dep_types
                     })
-                if declared:
-                    clean_declared = declared.lstrip("^~>=<")
+
+            if BLACKLISTED_VERSIONS and declared_info:
+                for dep_type, declared_version in declared_info.items():
+                    clean_declared = declared_version.lstrip("^~>=<")
                     if clean_declared in BLACKLISTED_VERSIONS:
                         blacklisted_found.append({
                             "repo": repo,
                             "path": match["path"],
-                            "version": declared,
-                            "type": "declared"
+                            "location": None,
+                            "version": declared_version,
+                            "type": "declared",
+                            "dep_types": [dep_type]
                         })
+
+        # Process Dockerfile findings
+        for df_match in result.get("dockerfile_matches", []):
+            for cmd in df_match["npm_commands"]:
+                cmd_type = cmd["type"]
+                dockerfile_findings[cmd_type].append({
+                    "repo": repo,
+                    "path": df_match["path"],
+                    "line": cmd["line"],
+                    "command": cmd["command"]
+                })
 
     print("\n" + "=" * 60)
     print("SUMMARY REPORT")
@@ -386,10 +545,21 @@ def generate_report(results):
 
     print(f"\n📦 Package: {PACKAGE_NAME}")
     print(f"📊 Repos with matches: {len(results)}")
+    if transitive_only_count > 0:
+        print(f"   ↳ {transitive_only_count} as transitive dependency only (not in package.json)")
 
-    print(f"\n📋 Unique declared versions ({len(declared_versions)}):")
-    for v in sorted(declared_versions):
-        print(f"   • {v}")
+    all_declared = declared_versions["dependencies"] | declared_versions["devDependencies"]
+    print(f"\n📋 Unique declared versions ({len(all_declared)}):")
+    if declared_versions["dependencies"]:
+        print(f"   dependencies:")
+        for v in sorted(declared_versions["dependencies"]):
+            print(f"      • {v}")
+    if declared_versions["devDependencies"]:
+        print(f"   devDependencies:")
+        for v in sorted(declared_versions["devDependencies"]):
+            print(f"      • {v}")
+    if not all_declared:
+        print(f"   (none)")
 
     print(f"\n🔒 Unique resolved versions ({len(resolved_versions)}):")
     for v in sorted(resolved_versions):
@@ -400,13 +570,73 @@ def generate_report(results):
         if blacklisted_found:
             print(f"\n⚠️  BLACKLISTED VERSIONS DETECTED ({len(blacklisted_found)}):")
             for item in blacklisted_found:
+                dep_type_str = ", ".join(item.get('dep_types', ['unknown']))
                 print(f"   ❌ {item['repo']}")
                 print(f"      Path: {item['path']}")
-                print(f"      Version: {item['version']} ({item['type']})")
+                if item.get('location'):
+                    print(f"      Location: {item['location']}")
+                print(f"      Version: {item['version']} ({item['type']}, {dep_type_str})")
         else:
             print("\n✅ No blacklisted versions detected!")
     else:
         print("\n⚠️  No BLACKLISTED_VERSIONS configured")
+
+    if missing_lockfiles:
+        at_risk_count = 0
+        print(f"\n📁 MISSING LOCKFILES ({len(missing_lockfiles)}):")
+        print("   (Cannot determine resolved versions without package-lock.json)")
+        
+        for item in missing_lockfiles:
+            declared_info = item['declared_info']
+            all_at_risk = {}
+            
+            if BLACKLISTED_VERSIONS:
+                for dep_type, version in declared_info.items():
+                    at_risk = check_blacklist_risk(version, BLACKLISTED_VERSIONS)
+                    if at_risk:
+                        all_at_risk[dep_type] = {"version": version, "at_risk": at_risk}
+            
+            declared_str = ", ".join(f"{v} ({k})" for k, v in declared_info.items())
+            
+            if all_at_risk:
+                at_risk_count += 1
+                print(f"   🚨 {item['repo']}")
+                print(f"      Path: {item['path']}")
+                print(f"      Declared: {declared_str}")
+                for dep_type, info in all_at_risk.items():
+                    print(f"      ⚠️  AT RISK ({dep_type}): {info['version']} could resolve to: {', '.join(sorted(info['at_risk']))}")
+            else:
+                print(f"   📦 {item['repo']}")
+                print(f"      Path: {item['path']}")
+                print(f"      Declared: {declared_str}")
+        
+        if at_risk_count > 0:
+            print(f"\n   🚨 {at_risk_count} repo(s) at risk of resolving to blacklisted versions!")
+    else:
+        print("\n✅ All matched packages have lockfiles")
+
+    # Dockerfile npm command findings
+    total_dockerfile_findings = sum(len(v) for v in dockerfile_findings.values())
+    if total_dockerfile_findings > 0:
+        print(f"\n🐳 DOCKERFILE NPM COMMANDS ({total_dockerfile_findings} found):")
+        
+        if dockerfile_findings["npm ci"]:
+            print(f"\n   ✅ npm ci ({len(dockerfile_findings['npm ci'])}) - recommended for CI/CD:")
+            for item in dockerfile_findings["npm ci"]:
+                print(f"      • {item['repo']}")
+                print(f"        {item['path']}:{item['line']} → {item['command']}")
+        
+        if dockerfile_findings["npm install"]:
+            print(f"\n   ⚠️  npm install ({len(dockerfile_findings['npm install'])}) - consider using 'npm ci' for reproducible builds:")
+            for item in dockerfile_findings["npm install"]:
+                print(f"      • {item['repo']}")
+                print(f"        {item['path']}:{item['line']} → {item['command']}")
+        
+        if dockerfile_findings["npm i"]:
+            print(f"\n   ⚠️  npm i ({len(dockerfile_findings['npm i'])}) - consider using 'npm ci' for reproducible builds:")
+            for item in dockerfile_findings["npm i"]:
+                print(f"      • {item['repo']}")
+                print(f"        {item['path']}:{item['line']} → {item['command']}")
 
     print("\n" + "=" * 60)
 
@@ -452,14 +682,37 @@ def main():
 
     logger.info(f"Total matches: {len(results)}")
 
-    print("\n=== RESULTS ===")
+    print("\n=== PACKAGE RESULTS ===")
     for r in results:
         repo = r["repo"]
-        for match in r["matches"]:
+        for match in r.get("matches", []):
             path = match["path"]
-            declared = match.get("declared_version") or "-"
-            resolved = match.get("resolved_version") or "-"
-            print(f"{repo} ({path}) - declared: {declared}, resolved: {resolved}")
+            declared_info = match.get("declared_versions") or {}
+            is_transitive = match.get("is_transitive_only", False)
+            declared = ", ".join(f"{v} ({k})" for k, v in declared_info.items()) if declared_info else "(transitive only)"
+            resolved_list = match.get("resolved_versions", [])
+            
+            if resolved_list:
+                for resolved_item in resolved_list:
+                    version = resolved_item["version"]
+                    location = resolved_item["location"]
+                    transitive_marker = " [transitive]" if is_transitive else ""
+                    print(f"{repo} ({path}) - declared: {declared}, resolved: {version} @ {location}{transitive_marker}")
+            else:
+                print(f"{repo} ({path}) - declared: {declared}, resolved: -")
+
+    print("\n=== DOCKERFILE RESULTS ===")
+    dockerfile_count = 0
+    for r in results:
+        repo = r["repo"]
+        for df_match in r.get("dockerfile_matches", []):
+            dockerfile_count += 1
+            path = df_match["path"]
+            for cmd in df_match["npm_commands"]:
+                print(f"{repo} ({path}:{cmd['line']}) - {cmd['type']}: {cmd['command']}")
+    
+    if dockerfile_count == 0:
+        print("(no npm commands found in Dockerfiles)")
 
     blacklisted = generate_report(results)
 
