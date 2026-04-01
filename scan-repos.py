@@ -5,6 +5,7 @@ import base64
 import json
 import time
 import logging
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import nodesemver
@@ -31,13 +32,33 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # -----------------------------
-# Logging
+# Logging setup
 # -----------------------------
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# Create logs directory if it doesn't exist
+log_dir = Path(__file__).parent / "logs"
+log_dir.mkdir(exist_ok=True)
+
+log_file = log_dir / "scan.log"
+
+# Configure logging with both console and file handlers
 logger = logging.getLogger(__name__)
+logger.setLevel(LOG_LEVEL)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(LOG_LEVEL)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console_handler.setFormatter(console_formatter)
+
+# File handler with timestamps
+file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+file_handler.setLevel(LOG_LEVEL)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler.setFormatter(file_formatter)
+
+# Add handlers to logger
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 BASE_URL = "https://api.github.com"
 
@@ -296,12 +317,40 @@ def check_package_json(repo, path):
 
 
 # -----------------------------
+# Registry detection
+# -----------------------------
+PUBLIC_NPM_REGISTRY_PATTERNS = [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+]
+
+def is_public_registry(resolved_url):
+    """
+    Check if the resolved URL points to a public npm registry.
+    Returns True if it's a public registry, False otherwise.
+    """
+    if not resolved_url:
+        return False
+    
+    resolved_lower = resolved_url.lower()
+    for pattern in PUBLIC_NPM_REGISTRY_PATTERNS:
+        if pattern in resolved_lower:
+            return True
+    return False
+
+
+# -----------------------------
 # package-lock.json
 # -----------------------------
 def check_package_lock(repo, path):
     """
     Returns a list of all occurrences of the package in the lockfile.
-    Each occurrence is a dict: {"location": "node_modules/...", "version": "x.y.z"}
+    Each occurrence is a dict: {
+        "location": "node_modules/...",
+        "version": "x.y.z",
+        "resolved": "https://...",
+        "is_public_registry": True/False
+    }
     """
     content = get_file_content(repo, path)
     if not content:
@@ -321,15 +370,34 @@ def check_package_lock(repo, path):
                 version = v.get("version")
                 if version:
                     location_type = "direct" if k == f"node_modules/{PACKAGE_NAME}" else "nested"
+                    resolved_url = v.get("resolved", "")
+                    public_registry = is_public_registry(resolved_url)
                     logger.info(f"{repo}: found in {path} ({location_type}: {k})")
-                    found.append({"location": k, "version": version})
+                    if public_registry:
+                        logger.info(f"{repo}: ⚠️ uses PUBLIC registry: {resolved_url}")
+                    found.append({
+                        "location": k,
+                        "version": version,
+                        "resolved": resolved_url,
+                        "is_public_registry": public_registry
+                    })
 
     # Lockfile v1 format (dependencies object) - fallback if nothing found in packages
     if not found and "dependencies" in lock and PACKAGE_NAME in lock["dependencies"]:
-        version = lock["dependencies"][PACKAGE_NAME].get("version")
+        dep_info = lock["dependencies"][PACKAGE_NAME]
+        version = dep_info.get("version")
         if version:
+            resolved_url = dep_info.get("resolved", "")
+            public_registry = is_public_registry(resolved_url)
             logger.info(f"{repo}: found in {path} (v1 format)")
-            found.append({"location": f"node_modules/{PACKAGE_NAME}", "version": version})
+            if public_registry:
+                logger.info(f"{repo}: ⚠️ uses PUBLIC registry: {resolved_url}")
+            found.append({
+                "location": f"node_modules/{PACKAGE_NAME}",
+                "version": version,
+                "resolved": resolved_url,
+                "is_public_registry": public_registry
+            })
 
     return found
 
@@ -479,6 +547,15 @@ def generate_report(results):
     missing_lockfiles = []
     transitive_only_count = 0
     dockerfile_findings = {"npm ci": [], "npm install": [], "npm i": []}
+    public_registry_findings = []
+    
+    # Collect all report lines for file output
+    report_lines = []
+    
+    def print_and_log(text=""):
+        """Print to console and collect for file output"""
+        print(text)
+        report_lines.append(text)
 
     for result in results:
         repo = result["repo"]
@@ -502,7 +579,18 @@ def generate_report(results):
             for resolved_item in resolved_list:
                 version = resolved_item["version"]
                 location = resolved_item["location"]
+                resolved_url = resolved_item.get("resolved", "")
+                is_public = resolved_item.get("is_public_registry", False)
                 resolved_versions.add(version)
+
+                if is_public:
+                    public_registry_findings.append({
+                        "repo": repo,
+                        "path": match["path"],
+                        "location": location,
+                        "version": version,
+                        "resolved": resolved_url
+                    })
 
                 if BLACKLISTED_VERSIONS and version in BLACKLISTED_VERSIONS:
                     dep_types = list(declared_info.keys()) if declared_info else ["transitive"]
@@ -539,52 +627,52 @@ def generate_report(results):
                     "command": cmd["command"]
                 })
 
-    print("\n" + "=" * 60)
-    print("SUMMARY REPORT")
-    print("=" * 60)
+    print_and_log("\n" + "=" * 60)
+    print_and_log("SUMMARY REPORT")
+    print_and_log("=" * 60)
 
-    print(f"\n📦 Package: {PACKAGE_NAME}")
-    print(f"📊 Repos with matches: {len(results)}")
+    print_and_log(f"\n📦 Package: {PACKAGE_NAME}")
+    print_and_log(f"📊 Repos with matches: {len(results)}")
     if transitive_only_count > 0:
-        print(f"   ↳ {transitive_only_count} as transitive dependency only (not in package.json)")
+        print_and_log(f"   ↳ {transitive_only_count} as transitive dependency only (not in package.json)")
 
     all_declared = declared_versions["dependencies"] | declared_versions["devDependencies"]
-    print(f"\n📋 Unique declared versions ({len(all_declared)}):")
+    print_and_log(f"\n📋 Unique declared versions ({len(all_declared)}):")
     if declared_versions["dependencies"]:
-        print(f"   dependencies:")
+        print_and_log(f"   dependencies:")
         for v in sorted(declared_versions["dependencies"]):
-            print(f"      • {v}")
+            print_and_log(f"      • {v}")
     if declared_versions["devDependencies"]:
-        print(f"   devDependencies:")
+        print_and_log(f"   devDependencies:")
         for v in sorted(declared_versions["devDependencies"]):
-            print(f"      • {v}")
+            print_and_log(f"      • {v}")
     if not all_declared:
-        print(f"   (none)")
+        print_and_log(f"   (none)")
 
-    print(f"\n🔒 Unique resolved versions ({len(resolved_versions)}):")
+    print_and_log(f"\n🔒 Unique resolved versions ({len(resolved_versions)}):")
     for v in sorted(resolved_versions):
-        print(f"   • {v}")
+        print_and_log(f"   • {v}")
 
     if BLACKLISTED_VERSIONS:
-        print(f"\n🚫 Blacklisted versions to check: {', '.join(sorted(BLACKLISTED_VERSIONS))}")
+        print_and_log(f"\n🚫 Blacklisted versions to check: {', '.join(sorted(BLACKLISTED_VERSIONS))}")
         if blacklisted_found:
-            print(f"\n⚠️  BLACKLISTED VERSIONS DETECTED ({len(blacklisted_found)}):")
+            print_and_log(f"\n⚠️  BLACKLISTED VERSIONS DETECTED ({len(blacklisted_found)}):")
             for item in blacklisted_found:
                 dep_type_str = ", ".join(item.get('dep_types', ['unknown']))
-                print(f"   ❌ {item['repo']}")
-                print(f"      Path: {item['path']}")
+                print_and_log(f"   ❌ {item['repo']}")
+                print_and_log(f"      Path: {item['path']}")
                 if item.get('location'):
-                    print(f"      Location: {item['location']}")
-                print(f"      Version: {item['version']} ({item['type']}, {dep_type_str})")
+                    print_and_log(f"      Location: {item['location']}")
+                print_and_log(f"      Version: {item['version']} ({item['type']}, {dep_type_str})")
         else:
-            print("\n✅ No blacklisted versions detected!")
+            print_and_log("\n✅ No blacklisted versions detected!")
     else:
-        print("\n⚠️  No BLACKLISTED_VERSIONS configured")
+        print_and_log("\n⚠️  No BLACKLISTED_VERSIONS configured")
 
     if missing_lockfiles:
         at_risk_count = 0
-        print(f"\n📁 MISSING LOCKFILES ({len(missing_lockfiles)}):")
-        print("   (Cannot determine resolved versions without package-lock.json)")
+        print_and_log(f"\n📁 MISSING LOCKFILES ({len(missing_lockfiles)}):")
+        print_and_log("   (Cannot determine resolved versions without package-lock.json)")
         
         for item in missing_lockfiles:
             declared_info = item['declared_info']
@@ -600,45 +688,77 @@ def generate_report(results):
             
             if all_at_risk:
                 at_risk_count += 1
-                print(f"   🚨 {item['repo']}")
-                print(f"      Path: {item['path']}")
-                print(f"      Declared: {declared_str}")
+                print_and_log(f"   🚨 {item['repo']}")
+                print_and_log(f"      Path: {item['path']}")
+                print_and_log(f"      Declared: {declared_str}")
                 for dep_type, info in all_at_risk.items():
-                    print(f"      ⚠️  AT RISK ({dep_type}): {info['version']} could resolve to: {', '.join(sorted(info['at_risk']))}")
+                    print_and_log(f"      ⚠️  AT RISK ({dep_type}): {info['version']} could resolve to: {', '.join(sorted(info['at_risk']))}")
             else:
-                print(f"   📦 {item['repo']}")
-                print(f"      Path: {item['path']}")
-                print(f"      Declared: {declared_str}")
+                print_and_log(f"   📦 {item['repo']}")
+                print_and_log(f"      Path: {item['path']}")
+                print_and_log(f"      Declared: {declared_str}")
         
         if at_risk_count > 0:
-            print(f"\n   🚨 {at_risk_count} repo(s) at risk of resolving to blacklisted versions!")
+            print_and_log(f"\n   🚨 {at_risk_count} repo(s) at risk of resolving to blacklisted versions!")
     else:
-        print("\n✅ All matched packages have lockfiles")
+        print_and_log("\n✅ All matched packages have lockfiles")
 
     # Dockerfile npm command findings
     total_dockerfile_findings = sum(len(v) for v in dockerfile_findings.values())
     if total_dockerfile_findings > 0:
-        print(f"\n🐳 DOCKERFILE NPM COMMANDS ({total_dockerfile_findings} found):")
+        print_and_log(f"\n🐳 DOCKERFILE NPM COMMANDS ({total_dockerfile_findings} found):")
         
         if dockerfile_findings["npm ci"]:
-            print(f"\n   ✅ npm ci ({len(dockerfile_findings['npm ci'])}) - recommended for CI/CD:")
+            print_and_log(f"\n   ✅ npm ci ({len(dockerfile_findings['npm ci'])}) - recommended for CI/CD:")
             for item in dockerfile_findings["npm ci"]:
-                print(f"      • {item['repo']}")
-                print(f"        {item['path']}:{item['line']} → {item['command']}")
+                print_and_log(f"      • {item['repo']}")
+                print_and_log(f"        {item['path']}:{item['line']} → {item['command']}")
         
         if dockerfile_findings["npm install"]:
-            print(f"\n   ⚠️  npm install ({len(dockerfile_findings['npm install'])}) - consider using 'npm ci' for reproducible builds:")
+            print_and_log(f"\n   ⚠️  npm install ({len(dockerfile_findings['npm install'])}) - consider using 'npm ci' for reproducible builds:")
             for item in dockerfile_findings["npm install"]:
-                print(f"      • {item['repo']}")
-                print(f"        {item['path']}:{item['line']} → {item['command']}")
+                print_and_log(f"      • {item['repo']}")
+                print_and_log(f"        {item['path']}:{item['line']} → {item['command']}")
         
         if dockerfile_findings["npm i"]:
-            print(f"\n   ⚠️  npm i ({len(dockerfile_findings['npm i'])}) - consider using 'npm ci' for reproducible builds:")
+            print_and_log(f"\n   ⚠️  npm i ({len(dockerfile_findings['npm i'])}) - consider using 'npm ci' for reproducible builds:")
             for item in dockerfile_findings["npm i"]:
-                print(f"      • {item['repo']}")
-                print(f"        {item['path']}:{item['line']} → {item['command']}")
+                print_and_log(f"      • {item['repo']}")
+                print_and_log(f"        {item['path']}:{item['line']} → {item['command']}")
 
-    print("\n" + "=" * 60)
+    # Public registry findings
+    if public_registry_findings:
+        print_and_log(f"\n🌐 PUBLIC REGISTRY USAGE ({len(public_registry_findings)} occurrences):")
+        print_and_log("   The following resolved packages from public npmjs registry:")
+        
+        # Group by repo for cleaner output
+        repos_using_public = {}
+        for item in public_registry_findings:
+            repo = item["repo"]
+            if repo not in repos_using_public:
+                repos_using_public[repo] = []
+            repos_using_public[repo].append(item)
+        
+        for repo, items in sorted(repos_using_public.items()):
+            print_and_log(f"\n   ⚠️  {repo}")
+            for item in items:
+                print_and_log(f"      • {item['version']} @ {item['location']}")
+                print_and_log(f"        resolved: {item['resolved']}")
+        
+        print_and_log(f"\n   Total repos using public registry: {len(repos_using_public)}")
+    else:
+        print_and_log(f"\n✅ No packages resolved from public npmjs registry")
+
+    print_and_log("\n" + "=" * 60)
+    
+    # Write report to file
+    report_file = log_dir / "summary_report.txt"
+    try:
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(report_lines))
+        logger.info(f"Summary report saved to: {report_file}")
+    except Exception as e:
+        logger.error(f"Failed to write summary report to file: {e}")
 
     return blacklisted_found
 
@@ -647,6 +767,10 @@ def generate_report(results):
 # Main
 # -----------------------------
 def main():
+    logger.info("=" * 60)
+    logger.info(f"Starting NPM package scan - logs will be written to: {log_file}")
+    logger.info("=" * 60)
+    
     validate_config()
 
     if not validate_github_token():
@@ -696,8 +820,10 @@ def main():
                 for resolved_item in resolved_list:
                     version = resolved_item["version"]
                     location = resolved_item["location"]
+                    is_public = resolved_item.get("is_public_registry", False)
                     transitive_marker = " [transitive]" if is_transitive else ""
-                    print(f"{repo} ({path}) - declared: {declared}, resolved: {version} @ {location}{transitive_marker}")
+                    public_marker = " [PUBLIC REGISTRY]" if is_public else ""
+                    print(f"{repo} ({path}) - declared: {declared}, resolved: {version} @ {location}{transitive_marker}{public_marker}")
             else:
                 print(f"{repo} ({path}) - declared: {declared}, resolved: -")
 
@@ -715,6 +841,12 @@ def main():
         print("(no npm commands found in Dockerfiles)")
 
     blacklisted = generate_report(results)
+
+    logger.info("=" * 60)
+    logger.info(f"Scan completed!")
+    logger.info(f"  - Full logs: {log_file}")
+    logger.info(f"  - Summary report: {log_dir / 'summary_report.txt'}")
+    logger.info("=" * 60)
 
     if blacklisted:
         exit(1)
